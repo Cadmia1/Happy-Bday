@@ -411,7 +411,12 @@ window.addEventListener('error', function(e){
   let planetA, planetB;
   function initPlanets(){
     const cx = W/2, cy = H/2;
-    const spread = Math.min(W,H)*0.26; // start further out
+    // Floored so the pair always starts well separated even if this runs
+    // once before the browser has reported a stable window size (W/H
+    // transiently 0 or tiny on some mobile browsers right at page load) --
+    // without this, a near-zero spread could start the planets almost on
+    // top of each other, skipping straight past the orbit/explosion.
+    const spread = Math.max(90, Math.min(W,H)*0.26); // start further out
     const angle = Math.random()*Math.PI*2;
     const ax = cx + Math.cos(angle)*spread;
     const ay = cy + Math.sin(angle)*spread;
@@ -436,6 +441,16 @@ window.addEventListener('error', function(e){
       { base:'#e9edf5', hi:'#ffffff', outline:'#5c5f6b' }, Math.floor(Math.random()*90000)+1);
   }
   initPlanets();
+
+  // Quantize a timestamp to a low update rate so an animation driven by it
+  // advances in small retro jumps instead of a perfectly smooth curve --
+  // like an old game only updating a sprite's position a few times a
+  // second rather than every frame.
+  const BOB_STEP_MS = 125; // ~8 updates/sec
+  function retroTime(t, stepMs){
+    stepMs = stepMs || BOB_STEP_MS;
+    return Math.floor(t / stepMs) * stepMs;
+  }
 
   // classic parametric heart curve, traced into the current (already
   // translated/rotated) context, centered on the origin with "radius" r
@@ -664,7 +679,12 @@ window.addEventListener('error', function(e){
       if(planetB.x < margin || planetB.x > W-margin) planetB.vx *= -0.6;
       if(planetB.y < margin || planetB.y > H-margin) planetB.vy *= -0.6;
 
-      if(dist <= planetA.r + planetB.r){
+      // Safety net: the orbit should always decay into a collision within a
+      // few seconds, but force one past a generous timeout regardless --
+      // guarantees the explosion always plays even if some real-world
+      // timing quirk (a long tab-backgrounded pause, an unusual resize,
+      // etc.) ever let the pair drift without quite touching.
+      if(dist <= planetA.r + planetB.r || stateTime > 16000){
         collisionPoint = { x:(planetA.x+planetB.x)/2, y:(planetA.y+planetB.y)/2 };
         spawnExplosion(collisionPoint.x, collisionPoint.y);
         spawnSparkleBurst(collisionPoint.x, collisionPoint.y);
@@ -741,6 +761,61 @@ window.addEventListener('error', function(e){
     }
   }
 
+  // Pre-rendered chunky-pixel text bitmaps for the message panels, built with
+  // the exact same recipe as the Start/Replay button labels (small fixed
+  // source font, then nearest-neighbor scaled) -- that recipe is confirmed
+  // crisp on real iPhones. Drawing this text directly at full display size
+  // looks smooth/modern instead of retro; baking it into the massively
+  // upscaled low-res world buffer (the old approach) went blurry on iOS.
+  // Cached per unique string since the source bitmap doesn't depend on the
+  // size it's ultimately displayed at.
+  const PIXEL_TEXT_CACHE = {};
+  function getPixelTextBitmap(text){
+    let hit = PIXEL_TEXT_CACHE[text];
+    if(hit) return hit;
+
+    const srcFont = 16;
+    const scale = 6;
+    const finite = (v, fb) => (typeof v === 'number' && isFinite(v)) ? v : fb;
+
+    const measure = document.createElement('canvas').getContext('2d');
+    measure.font = `bold ${srcFont}px 'Courier New', monospace`;
+    const m = measure.measureText(text);
+    const left = finite(m.actualBoundingBoxLeft, 0);
+    const right = finite(m.actualBoundingBoxRight, finite(m.width, srcFont*text.length*0.6));
+    const ascent = finite(m.actualBoundingBoxAscent, srcFont*0.8);
+    const descent = finite(m.actualBoundingBoxDescent, srcFont*0.25);
+    const off = Math.max(1, Math.round(srcFont*0.11));
+
+    const lw = Math.ceil(left+right) + off*2;
+    const lh = Math.ceil(ascent+descent) + off*2;
+    const drawX = off + left, drawY = off + ascent;
+
+    const low = document.createElement('canvas');
+    low.width = lw; low.height = lh;
+    const lctx = low.getContext('2d');
+    lctx.imageSmoothingEnabled = false;
+    lctx.font = `bold ${srcFont}px 'Courier New', monospace`;
+    lctx.textAlign = 'left';
+    lctx.textBaseline = 'alphabetic';
+    lctx.fillStyle = '#0d3f3b';
+    lctx.fillText(text, drawX+off*2, drawY+off*2);
+    lctx.fillStyle = '#39c5bb';
+    lctx.fillText(text, drawX+off, drawY+off);
+    lctx.fillStyle = '#fff8fc';
+    lctx.fillText(text, drawX, drawY);
+
+    const hi = document.createElement('canvas');
+    hi.width = lw*scale; hi.height = lh*scale;
+    const hctx = hi.getContext('2d');
+    hctx.imageSmoothingEnabled = false;
+    hctx.drawImage(low, 0, 0, hi.width, hi.height);
+
+    const bmp = { canvas: hi, ratio: lw/lh };
+    PIXEL_TEXT_CACHE[text] = bmp;
+    return bmp;
+  }
+
   // Shared retro dialog-box + pixel-text renderer, drawn straight into the
   // low-res pixel buffer (rather than as DOM/CSS text) so both messages get
   // identical chunky pixel edges and colors, with no dependency on a web
@@ -750,6 +825,10 @@ window.addEventListener('error', function(e){
     opts = opts || {};
     const alpha = opts.alpha !== undefined ? opts.alpha : 1;
     const bob = opts.bob || 0;
+    // text can lag slightly behind the box's own bob motion (a subtle
+    // trailing offset, not a full independent animation) so the two don't
+    // read as perfectly rigidly attached
+    const textLag = (opts.textBob !== undefined ? opts.textBob : bob) - bob;
     const lineGap = opts.lineGap || 1.3;
     const padTop = opts.padTop !== undefined ? opts.padTop : 0.6;
     const padBottom = opts.padBottom !== undefined ? opts.padBottom : 0.65;
@@ -759,10 +838,12 @@ window.addEventListener('error', function(e){
 
     ctx.save();
     let maxW = 0;
-    for(const l of lines){
+    const lineWidths = lines.map(l => {
       ctx.font = `bold ${l.size}px 'Courier New', monospace`;
-      maxW = Math.max(maxW, ctx.measureText(l.text).width);
-    }
+      const w = ctx.measureText(l.text).width;
+      maxW = Math.max(maxW, w);
+      return w;
+    });
     const boxW = maxW + maxSize*1.3;
 
     const slotHeights = lines.map(l => l.size*lineGap);
@@ -781,21 +862,20 @@ window.addEventListener('error', function(e){
       ctx.strokeStyle = 'rgba(57,197,187,0.6)';
       ctx.strokeRect(cx-boxW/2+borderW/2, boxTop+borderW/2, boxW-borderW, boxH-borderW);
 
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      const mainColor = '#fff8fc', shadowA = '#39c5bb', shadowB = '#0d3f3b';
-      let y = boxTop + maxSize*padTop;
+      ctx.imageSmoothingEnabled = false;
+      let y = boxTop + maxSize*padTop + textLag;
       lines.forEach((l, i) => {
         const slot = slotHeights[i];
         const ty = y + slot/2;
-        const off = Math.max(1, Math.round(l.size*0.11));
-        ctx.font = `bold ${l.size}px 'Courier New', monospace`;
-        ctx.fillStyle = shadowB;
-        ctx.fillText(l.text, cx+off*2, ty+off*2);
-        ctx.fillStyle = shadowA;
-        ctx.fillText(l.text, cx+off, ty+off);
-        ctx.fillStyle = mainColor;
-        ctx.fillText(l.text, cx, ty);
+        const bmp = getPixelTextBitmap(l.text);
+        // Match the bitmap's width to the *actual* measured text width at
+        // this line's size (the same measurement the box was sized around),
+        // then derive height from the bitmap's own aspect ratio -- rather
+        // than assuming a fixed height-to-fontsize relationship, which was
+        // producing text noticeably wider than the box expected.
+        const bw = lineWidths[i];
+        const bh = bw / bmp.ratio;
+        ctx.drawImage(bmp.canvas, cx - bw/2, ty - bh/2, bw, bh);
         y += slot;
       });
     }
@@ -812,14 +892,20 @@ window.addEventListener('error', function(e){
       return;
     }
 
-    let alpha = 0, rise = 16, bob = 0;
+    let alpha = 0, rise = 16, bob = 0, textBob = 0;
     if(state === 'text'){
       const p = Math.min(1, stateTime/1500);
       const eased = 1 - Math.pow(1-p, 3); // ease-out
       alpha = eased;
       rise = 16*(1-eased);
-      // gentle continuous up/down bob once it's settled in, like a live retro prompt
-      bob = Math.sin(t*0.0022) * Math.max(3, Math.min(W,H)*0.012) * eased;
+      // gentle up/down bob once it's settled in, like a live retro prompt --
+      // stepped rather than perfectly smooth, so it reads as an old low-fps
+      // sprite bounce instead of a modern eased animation
+      const bobAmp = Math.max(3, Math.min(W,H)*0.012);
+      bob = Math.round(Math.sin(retroTime(t)*0.0022) * bobAmp) * eased;
+      // text trails the box by one whole step, so the two don't move in
+      // perfect lockstep
+      textBob = Math.round(Math.sin(retroTime(t-BOB_STEP_MS)*0.0022) * bobAmp) * eased;
     }
     if(alpha <= 0.002){
       cakeGif.style.opacity = 0;
@@ -840,7 +926,7 @@ window.addEventListener('error', function(e){
       { text: 'HAPPY', size: baseSize },
       { text: 'BIRTHDAY', size: baseSize },
       { text: 'MELI <3', size: subSize }
-    ], { alpha, bob: bob-rise, lineGap: 1.15, padTop: 0.55, padBottom: 0.6, extraBottom });
+    ], { alpha, bob: bob-rise, textBob: textBob-rise, lineGap: 1.15, padTop: 0.55, padBottom: 0.6, extraBottom });
 
     // sit just below the text, inside the same panel
     cakeGif.style.width = gifSize + 'px';
@@ -856,8 +942,12 @@ window.addEventListener('error', function(e){
     // same size/font as the final "HAPPY BIRTHDAY" message, with a small
     // auto-shrink safety net so the longest line never overflows narrow screens
     const baseSize = Math.max(24, Math.min(W,H)*0.09);
-    const bob = Math.sin(t*0.0022) * Math.max(3, Math.min(W,H)*0.012);
-    const texts = ['TO THE MOST', 'BEAUTIFUL GIRL', 'TO EVER EXIST'];
+    // stepped bob, matching the final message's retro low-fps bounce -- text
+    // trails the box by a touch, using a slightly delayed timestamp
+    const bobAmp = Math.max(3, Math.min(W,H)*0.012);
+    const bob = Math.round(Math.sin(retroTime(t)*0.0022) * bobAmp);
+    const textBob = Math.round(Math.sin(retroTime(t-BOB_STEP_MS)*0.0022) * bobAmp);
+    const texts = ['FOR THE MOST', 'BEAUTIFUL GIRL', 'TO EVER EXIST'];
 
     ctx.font = `bold ${baseSize}px 'Courier New', monospace`;
     let maxW = 0;
@@ -867,7 +957,7 @@ window.addEventListener('error', function(e){
     const size = baseSize*scale;
 
     const lines = texts.map(text => ({ text, size }));
-    const box = drawPixelPanel(W/2, H*0.32, lines, { alpha: 1, bob, lineGap: 1.15, padTop: 0.55, padBottom: 0.6 });
+    const box = drawPixelPanel(W/2, H*0.32, lines, { alpha: 1, bob, textBob, lineGap: 1.15, padTop: 0.55, padBottom: 0.6 });
 
     // keep the start button anchored just below the box, wherever it ends up
     startBtn.style.top = Math.round(box.boxBottom + Math.min(W,H)*0.075) + 'px';
@@ -909,13 +999,11 @@ window.addEventListener('error', function(e){
       ctx.fillStyle = `rgba(255,220,240,${flash*0.85})`;
       ctx.fillRect(0,0,W,H);
     }
-
-    drawRetroText(t);
-    if(!running) drawIntroText(t);
   }
 
   function render(t){
-    // draw the whole scene into a small low-res buffer...
+    // draw the whole scene (planets, particles, background -- everything
+    // meant to look like chunky retro pixel art) into a small low-res buffer...
     ctx = pctx;
     ctx.clearRect(0,0,pixCanvas.width,pixCanvas.height);
     ctx.save();
@@ -935,6 +1023,18 @@ window.addEventListener('error', function(e){
     ctx.imageSmoothingEnabled = false;
     ctx.clearRect(0,0,canvas.width,canvas.height);
     ctx.drawImage(pixCanvas, 0,0,pixCanvas.width,pixCanvas.height, 0,0,canvas.width,canvas.height);
+
+    // Draw the message panels as a separate high-resolution overlay pass
+    // directly onto the display canvas, instead of baking them into the
+    // low-res buffer above and blowing them up ~15x with the rest of the
+    // scene (which went blurry on iPhone). The panel text itself is drawn
+    // via getPixelTextBitmap()'s pre-rendered chunky-pixel bitmaps -- the
+    // same small-source-then-nearest-neighbor-scale recipe the Start/Replay
+    // labels use, which keeps the retro pixel-font look without the blur.
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+    ctx.imageSmoothingEnabled = false;
+    drawRetroText(t);
+    if(!running) drawIntroText(t);
   }
 
   let last = performance.now();
@@ -951,6 +1051,7 @@ window.addEventListener('error', function(e){
     if(running) return;
     running = true;
     last = performance.now();
+    render(last); // paint the orbiting planets immediately, no gap before the first rAF
     requestAnimationFrame(loop);
   }
 
